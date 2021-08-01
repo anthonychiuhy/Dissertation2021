@@ -1,4 +1,7 @@
 # deep-kexpfam
+This directory is cloned directly from
+https://github.com/kevin-w-li/deep-kexpfam
+
 This repo has the code for the paper:
 
 > [Learning deep kernels for exponential family densities](https://arxiv.org/abs/1811.08357)\
