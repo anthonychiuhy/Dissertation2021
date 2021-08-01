@@ -91,8 +91,8 @@ class MLPLayers_reparam(torch.nn.Module):
             sigma_b = self._sigma(self.rho_bs[i])
             epsilon_W = torch.randn_like(mu_W)
             epsilon_b = torch.randn_like(mu_b)
-            #epsilon_W = torch.ones_like(mu_W)
-            #epsilon_b = torch.ones_like(mu_b)
+            #epsilon_W = torch.zeros_like(mu_W)
+            #epsilon_b = torch.zeros_like(mu_b)
             
             # reparameterisation trick
             W =  mu_W + sigma_W * epsilon_W
@@ -117,7 +117,7 @@ class MLPLayers_reparam(torch.nn.Module):
 
 
 class AdditiveCouplingLayers(torch.nn.Module):
-    def __init__(self, d, D, layers, dropout_rate):
+    def __init__(self, d, D, layers, dropout_rate, var_inf=False):
         assert D > d
         
         super().__init__()
@@ -139,7 +139,8 @@ class AdditiveCouplingLayers(torch.nn.Module):
         self.dims2 = dims2
         self.layers = layers
         self.MLP_list = torch.nn.ModuleList(MLP_list)
-        self.s = torch.nn.Parameter(torch.randn(D)) # scaling layer parameters
+        if not var_inf:
+            self.s = torch.nn.Parameter(torch.randn(D)) # scaling layer parameters
 
     def forward(self, Z):
         assert Z.shape[1] == self.D
@@ -321,29 +322,26 @@ class Flow:
         log_pX = self.log_likelihood(X, with_grad)
         return log_pX.sum()
     
-    def train(self, obj, batch_size, iterations, lr, weight_decay=0, show_progress=False):
+    def train(self, obj, sample_size, batch_size, epochs, lr, weight_decay=0, show_progress=False):
         optimizer = torch.optim.Adam(self.cl.parameters(), lr=lr, weight_decay=weight_decay)
-        dataset = ObjectDataset(obj, batch_size*iterations)
+        dataset = ObjectDataset(obj, sample_size)
         loader = DataLoader(dataset , batch_size=batch_size , shuffle=True)
         
-        log_likes = []
-        for i, X_train in enumerate(loader):
-            neg_log_like = -self.log_data_likelihood(X_train, with_grad=True)
+        for epoch in range(epochs):
+            for X_train in loader:
+                neg_log_like = -self.log_data_likelihood(X_train, with_grad=True)
 
-            optimizer.zero_grad()
-            neg_log_like.backward()
-            optimizer.step()
+                optimizer.zero_grad()
+                neg_log_like.backward()
+                optimizer.step()
 
-            X = torch.from_numpy(obj.sample(batch_size)).float()
-            log_like = self.log_data_likelihood(X)
-            log_likes.append(log_like)
-            
             # print status
             if show_progress:
-                if i % 100 == 0:
-                    print('iterations = %d, log_like = %.5f' % (i+1, log_like))
-            
-        return log_likes
+                if epoch % 10 == 0:
+                    # calculate and show log likelihood
+                    X = torch.from_numpy(obj.sample(sample_size)).float()
+                    log_like = self.log_data_likelihood(X)
+                    print('epoch = %d, log_like = %.5f' % (epoch+1, log_like))
 
 
 class AffineCouplingLayers_VI(AffineCouplingLayers):
@@ -369,7 +367,7 @@ class AffineCouplingLayers_VI(AffineCouplingLayers):
 
 class AdditiveCouplingLayers_VI(AdditiveCouplingLayers):
     def __init__(self, d, D, layers):
-        super().__init__(d, D, layers, dropout_rate=0)
+        super().__init__(d, D, layers, dropout_rate=0, var_inf=True)
         
         MLP_list = []
         # Construct coupling layers in an alternating manner
