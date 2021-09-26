@@ -48,11 +48,11 @@ class MLPLayers_reparam(torch.nn.Module):
         
         for i in range(len(dims)-1):
             k1 = torch.tensor(1 / dims[i]).sqrt()
-            k2 = -10
+            k2 = -5
             mu_W = torch.nn.Parameter(k1 * (2 * torch.rand((dims[i], dims[i+1])) - 1))
             mu_b = torch.nn.Parameter(k1 * (2 * torch.rand(dims[i+1]) - 1))
-            rho_W = torch.nn.Parameter(k2 * torch.rand_like(mu_W))
-            rho_b = torch.nn.Parameter(k2 * torch.rand_like(mu_b))
+            rho_W = torch.nn.Parameter(k2 * torch.ones_like(mu_W))
+            rho_b = torch.nn.Parameter(k2 * torch.ones_like(mu_b))
             
             mu_Ws.append(mu_W)
             mu_bs.append(mu_b)
@@ -329,10 +329,10 @@ class Flow:
         
         for epoch in range(epochs):
             for X_train in loader:
-                neg_log_like = -self.log_data_likelihood(X_train, with_grad=True)
+                cost = -self.log_data_likelihood(X_train, with_grad=True)
 
                 optimizer.zero_grad()
-                neg_log_like.backward()
+                cost.backward()
                 optimizer.step()
 
             # print status
@@ -363,6 +363,29 @@ class AffineCouplingLayers_VI(AffineCouplingLayers):
         for scale, translate in zip(self.scales, self.translates):
             scale.sample_params()
             translate.sample_params()
+    
+    def init_params_from_coupling_layers(self, cl):
+        posterior_rho = -5.
+        
+        assert len(cl.scales) == len(self.scales)
+        assert len(cl.scales[0].layers) == len(self.scales[0].mu_Ws)
+        
+        for i in range(len(cl.scales)):
+            MLP_cl_scale = cl.scales[i]
+            MLP_self_scale = self.scales[i]
+            MLP_cl_translate = cl.translates[i]
+            MLP_self_translate = self.translates[i]
+            for MLP_cl, MLP_self in [(MLP_cl_scale, MLP_self_scale), (MLP_cl_translate, MLP_self_translate)]:
+                for j in range(len(MLP_cl.layers)):
+                    W = MLP_cl.layers[j].state_dict()['weight'].T.clone().contiguous()
+                    b = MLP_cl.layers[j].state_dict()['bias'].clone()
+
+                    MLP_self.mu_Ws[j] = torch.nn.Parameter(W)
+                    MLP_self.mu_bs[j] = torch.nn.Parameter(b)
+                    MLP_self.rho_Ws[j] = torch.nn.Parameter(posterior_rho * torch.ones_like(W))
+                    MLP_self.rho_bs[j] = torch.nn.Parameter(posterior_rho * torch.ones_like(b))
+
+        self.sample_params()
 
 
 class AdditiveCouplingLayers_VI(AdditiveCouplingLayers):
@@ -400,7 +423,29 @@ class AdditiveCouplingLayers_VI(AdditiveCouplingLayers):
     def _sigma(self, rho):
         return torch.log(1 + torch.exp(rho))
         
+    def init_params_from_coupling_layers(self, cl):
+        posterior_rho = -5.
         
+        assert len(cl.MLP_list) == len(self.MLP_list)
+        assert len(cl.MLP_list[0].layers) == len(self.MLP_list[0].mu_Ws)
+        
+        for i in range(len(cl.MLP_list)):
+            MLP_cl = cl.MLP_list[i]
+            MLP_self = self.MLP_list[i]
+            for j in range(len(MLP_cl.layers)):
+                W = MLP_cl.layers[j].state_dict()['weight'].T.clone().contiguous()
+                b = MLP_cl.layers[j].state_dict()['bias'].clone()
+
+                MLP_self.mu_Ws[j] = torch.nn.Parameter(W)
+                MLP_self.mu_bs[j] = torch.nn.Parameter(b)
+                MLP_self.rho_Ws[j] = torch.nn.Parameter(posterior_rho * torch.ones_like(W))
+                MLP_self.rho_bs[j] = torch.nn.Parameter(posterior_rho * torch.ones_like(b))
+
+        s = cl.s.detach().clone()
+        self.mu_s = torch.nn.Parameter(s)
+        self.rho_s = torch.nn.Parameter(posterior_rho * torch.ones_like(s))
+
+        self.sample_params()
 
 
 class Flow_VI(Flow):
@@ -412,12 +457,116 @@ class Flow_VI(Flow):
             self.cl = AffineCouplingLayers_VI(masks)
         elif coupling_layers == 'additive':
             self.cl = AdditiveCouplingLayers_VI(d, D, layers)
+            
+        self.coupling_layers = coupling_layers
     
-    def train(self):
-        pass
+    def train(self, obj, sample_size, batch_size, epochs, lr, weight_decay=0, show_progress=False):
+        optimizer = torch.optim.Adam(self.cl.parameters(), lr=lr, weight_decay=weight_decay)
+        dataset = ObjectDataset(obj, sample_size)
+        loader = DataLoader(dataset , batch_size=batch_size , shuffle=True)
+
+        for epoch in range(epochs):
+            for X_batch in loader:
+                self.sample_params()
+
+                elbo = self._elbo(X_batch, sample_size)
+                cost = -1 / sample_size * elbo
+
+                optimizer.zero_grad()
+                cost.backward()
+                optimizer.step()
+        
+            # print status
+            if show_progress:
+                if epoch % 10 == 0:
+                    # calculate and show log likelihood
+                    X = torch.from_numpy(obj.sample(sample_size)).float()
+                    with torch.no_grad():
+                        elbo = self._elbo(X, sample_size)
+                    print('epoch = %d, ELBO = %.5f' % (epoch+1, elbo))
     
     def sample_params(self):
         self.cl.sample_params()
+    
+    def init_params_from_flow(self, flow):
+        self.cl.init_params_from_coupling_layers(flow.cl)
+    
+    def _elbo(self, X_batch, sample_size):
+        if self.coupling_layers == 'additive':
+            elbo = self._elbo_additive(X_batch, sample_size)
+        elif self.coupling_layers == 'affine':
+            elbo = self._elbo_affine(X_batch, sample_size)
+        
+        return elbo
+    
+    def _elbo_additive(self, X_batch, sample_size):
+        s = self.cl.s
+        mu_s = self.cl.mu_s
+        sigma_s = self.cl.sigma_s
+
+        dist_prior = MultivariateNormal(torch.zeros_like(s), torch.eye(len(s)))
+        dist_q = MultivariateNormal(mu_s, torch.diag(sigma_s ** 2))
+
+        log_prior = dist_prior.log_prob(s)
+        log_q = dist_q.log_prob(s)
+        
+        for i in range(len(self.cl.MLP_list)):
+            MLP = self.cl.MLP_list[i]
+            for j in range(len(MLP.mu_Ws)):
+                W = MLP.Ws[j].view(-1)
+                b = MLP.bs[j].view(-1)
+                mu_W = MLP.mu_Ws[j].view(-1)
+                mu_b = MLP.mu_bs[j].view(-1)
+                sigma_W = MLP.sigma_Ws[j].view(-1)
+                sigma_b = MLP.sigma_bs[j].view(-1)
+
+                dist_prior = MultivariateNormal(torch.zeros_like(W), torch.eye(len(W)))
+                dist_q = MultivariateNormal(mu_W, torch.diag(sigma_W ** 2))
+
+                log_prior += dist_prior.log_prob(W)
+                log_q += dist_q.log_prob(W)
+
+                dist_prior = MultivariateNormal(torch.zeros_like(b), torch.eye(len(b)))
+                dist_q = MultivariateNormal(mu_b, torch.diag(sigma_b ** 2))
+
+                log_prior += dist_prior.log_prob(b)
+                log_q += dist_q.log_prob(b)
+
+        log_like = sample_size / len(X_batch) * self.log_data_likelihood(X_batch, with_grad=True)
+
+        return log_like + log_prior - log_q
+    
+    def _elbo_affine(self, X_batch, sample_size):
+        log_prior = 0
+        log_q = 0
+        
+        for i in range(len(self.cl.scales)):
+            MLP_scale = self.cl.scales[i]
+            MLP_translate = self.cl.translates[i]
+            for MLP in [MLP_scale, MLP_translate]:
+                for j in range(len(MLP.mu_Ws)):
+                    W = MLP.Ws[j].view(-1)
+                    b = MLP.bs[j].view(-1)
+                    mu_W = MLP.mu_Ws[j].view(-1)
+                    mu_b = MLP.mu_bs[j].view(-1)
+                    sigma_W = MLP.sigma_Ws[j].view(-1)
+                    sigma_b = MLP.sigma_bs[j].view(-1)
+
+                    dist_prior = MultivariateNormal(torch.zeros_like(W), torch.eye(len(W)))
+                    dist_q = MultivariateNormal(mu_W, torch.diag(sigma_W ** 2))
+
+                    log_prior += dist_prior.log_prob(W)
+                    log_q += dist_q.log_prob(W)
+
+                    dist_prior = MultivariateNormal(torch.zeros_like(b), torch.eye(len(b)))
+                    dist_q = MultivariateNormal(mu_b, torch.diag(sigma_b ** 2))
+
+                    log_prior += dist_prior.log_prob(b)
+                    log_q += dist_q.log_prob(b)
+
+            log_like = sample_size / len(X_batch) * self.log_data_likelihood(X_batch, with_grad=True)
+            
+            return log_like + log_prior - log_q
         
         
         
